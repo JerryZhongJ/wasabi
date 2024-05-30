@@ -85,6 +85,7 @@ pub enum Hook {
 
     // together for call_pre and call_post
     Call,
+    CallIndirect,
     Return,
 
     Drop,

@@ -1,5 +1,5 @@
 use std::convert::TryInto;
-
+use std::sync::mpsc;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde_json;
@@ -67,14 +67,14 @@ pub fn add_hooks(
     } else {
         None
     };
-
-    module.functions.par_iter_mut().enumerate().for_each(|(fidx, function): (usize, &mut Function)| {
+    let (tx, rx) = mpsc::channel();
+    module.functions.par_iter_mut().enumerate().for_each_with(tx,|sender, (fidx, function): (usize, &mut Function)| {
         let fidx = fidx.into();
         // only instrument non-imported functions
         if function.code().is_none() {
             return;
         }
-
+        // println!("instrument into {}", function.name.as_ref().unwrap_or(&String::from("")));
         // move body out of function, so that function is not borrowed during iteration over the original body
         let original_body = {
             let dummy_body = Vec::new();
@@ -156,9 +156,12 @@ pub fn add_hooks(
         // However, because unreachable code can itself contain more blocks, we must actually
         // count the depth for "how far we are in unreachable mode" and only stop once we reach 0.
         let mut unreachable_depth = 0;
-
+        
         for (iidx, instr) in original_body.into_iter().enumerate() {
 
+            if let CallIndirect(_,_) = instr {
+                sender.send((fidx.to_usize(), iidx)).unwrap();
+            } 
             // End or Else could end the current "unreachable" block.
             if unreachable_depth > 0 {
                 match instr {
@@ -169,6 +172,9 @@ pub fn add_hooks(
             // Still unreachable, even after closing the current block?
             if unreachable_depth > 0 {
                 // 1. Copy over the instruction unaltered
+                if let CallIndirect(_,_) = instr{
+                    println!("call.indirect at {}:{} is not instrumented because it is unreachable", fidx.to_usize(), iidx);
+                }
                 instrumented_body.push(instr.clone());
                 // 2. If the unreachable code itself contains even deeper blocks, increase the "unreachable depth".
                 match instr {
@@ -185,7 +191,8 @@ pub fn add_hooks(
 
             let iidx: Idx<Instr> = iidx.into();
             let location = (fidx.to_const(), iidx.to_const());
-
+            
+            
             /*
              * add calls to hooks, typical instructions inserted for (not necessarily in this order if that saves us a local or so):
              * 1. duplicate instruction inputs via temporary locals
@@ -480,12 +487,13 @@ pub fn add_hooks(
                     unreachable_depth = 1;
                 }
                 Call(target_func_idx) => {
+                 
                     let func_ty = &module_info.read().functions[target_func_idx.to_usize()].type_;
                     type_stack.instr(func_ty);
 
                     if enabled_hooks.contains(Hook::Call) {
                         /* pre call hook */
-
+                        
                         let arg_tmps = function.add_fresh_locals(func_ty.inputs());
 
                         save_stack_to_locals(&mut instrumented_body, &arg_tmps);
@@ -516,11 +524,12 @@ pub fn add_hooks(
                     }
                 }
                 CallIndirect(ref func_ty, _ /* table idx == 0 in WASM version 1 */) => {
+                    
                     type_stack.instr(&instr.simple_type().unwrap());
 
-                    if enabled_hooks.contains(Hook::Call) {
+                    if enabled_hooks.contains(Hook::CallIndirect) {
                         /* pre call hook */
-
+                        
                         let target_table_idx_tmp = function.add_fresh_local(I32);
                         let arg_tmps = function.add_fresh_locals(func_ty.inputs());
 
@@ -770,10 +779,13 @@ pub fn add_hooks(
                 }
             }
         }
-
+        
         // finally, switch dummy body out against instrumented body
         function.code_mut().unwrap().body = instrumented_body;
     });
+    let mut indirect_callsites:Vec<(usize, usize)> = rx.iter().collect();
+    indirect_callsites.sort();
+    
 
     // actually add the hooks to module and check that inserted Idx is the one on the Hook struct
     let hooks = hooks.finish();
@@ -793,7 +805,7 @@ pub fn add_hooks(
     }
 
     Some((
-        generate_js(module_info.into_inner(), &js_hooks, node_js),
+        generate_js(module_info.into_inner(), indirect_callsites,&js_hooks, node_js),
         hook_count,
     ))
 }
@@ -819,18 +831,21 @@ impl ToConst for Label {
 impl BlockStackElement {
     fn append_end_hook_args(&self, append_to: &mut Vec<Instr>, fidx: Idx<Function>) {
         match self {
-            BlockStackElement::Function { end } => append_to.extend_from_slice(&[
-                fidx.to_const(), 
-                end.to_const()
-            ]),
+            BlockStackElement::Function { end } => {
+                append_to.extend_from_slice(&[fidx.to_const(), end.to_const()])
+            }
             BlockStackElement::Block { begin, end }
             | BlockStackElement::Loop { begin, end }
-            | BlockStackElement::If { begin_if: begin, end, .. } => append_to.extend_from_slice(&[
-                fidx.to_const(),
-                end.to_const(),
-                begin.to_const()
-            ]),
-            BlockStackElement::Else { begin_else, begin_if, end } => append_to.extend_from_slice(&[
+            | BlockStackElement::If {
+                begin_if: begin,
+                end,
+                ..
+            } => append_to.extend_from_slice(&[fidx.to_const(), end.to_const(), begin.to_const()]),
+            BlockStackElement::Else {
+                begin_else,
+                begin_if,
+                end,
+            } => append_to.extend_from_slice(&[
                 fidx.to_const(),
                 end.to_const(),
                 begin_else.to_const(),
@@ -850,7 +865,7 @@ impl BlockStackElement {
     }
 }
 
-fn generate_js(module_info: ModuleInfo, hooks: &[String], node_js: bool) -> String {
+fn generate_js(module_info: ModuleInfo, indirect_callsites:Vec<(usize, usize)> ,hooks: &[String], node_js: bool) -> String {
     let mut result = r#"/*
 * Generated by Wasabi. DO NOT EDIT.
 * Contains:
@@ -858,7 +873,8 @@ fn generate_js(module_info: ModuleInfo, hooks: &[String], node_js: bool) -> Stri
 *   - generated from program-to-instrument: static information and low-level hooks
 */
 
-"#.to_string();
+"#
+    .to_string();
 
     if node_js {
         // For Node.js, write the long.js dependency to a separate file (in main) and
@@ -873,10 +889,12 @@ fn generate_js(module_info: ModuleInfo, hooks: &[String], node_js: bool) -> Stri
         //    - needs to be run after every instrumentation
         // * Alternative B: compile Wasabi itself to WebAssembly, instrument at runtime
         result.push_str("// long.js\n");
-        result.push_str(include_str!("../../../js/long.js/long.js")
-            .lines()
-            .next()
-            .expect("could not include long.js dependency"));
+        result.push_str(
+            include_str!("../../../js/long.js/long.js")
+                .lines()
+                .next()
+                .expect("could not include long.js dependency"),
+        );
     }
     result.push_str("\n\n");
 
@@ -887,6 +905,12 @@ fn generate_js(module_info: ModuleInfo, hooks: &[String], node_js: bool) -> Stri
     result.push_str(&serde_json::to_string(&module_info).unwrap());
     result.push_str(";\n\n");
 
+    result.push_str("Wasabi.indirect_callsites = {");
+    for (idx, (fidx, iidx)) in indirect_callsites.iter().enumerate() {
+        result.push_str(&format!("\"{},{}\": {},", fidx, iidx, idx));
+    }
+    result.pop();
+    result.push_str("}\n\n");
     result.push_str("Wasabi.module.lowlevelHooks = {\n");
     for hook in hooks {
         result.push_str(hook);
